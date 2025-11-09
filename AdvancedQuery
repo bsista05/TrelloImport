@@ -1,6 +1,6 @@
 let
   // ==== Inline parameters ====
-  P = [ key="d88946e2e0671510f301b52e276ded9a", token="ATTAb78271290c71cd8b947d454f5f35d369dfb53feb227aa68ef30535d899b2afae09FD41DB", boardId="7EzNyT8y", base="https://api.trello.com/1/" ],
+  P = [ key="<INSERT KEY>", token="<INSERT API TOKEN>, boardId="<INSERT BOARD ID>", base="https://api.trello.com/1/" ],
 
 
   // ==== Lists (for List Name) ====
