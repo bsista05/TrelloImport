@@ -1,0 +1,125 @@
+let
+  // ==== Inline parameters ====
+  P = [ key="d88946e2e0671510f301b52e276ded9a", token="ATTAb78271290c71cd8b947d454f5f35d369dfb53feb227aa68ef30535d899b2afae09FD41DB", boardId="7EzNyT8y", base="https://api.trello.com/1/" ],
+
+
+  // ==== Lists (for List Name) ====
+  ListsJson = Json.Document(
+                Web.Contents(P[base],
+                  [ RelativePath = "boards/" & P[boardId] & "/lists",
+                    Query = [ key=P[key], token=P[token], fields="id,name" ] ])),
+  Lists = Table.ExpandRecordColumn(
+            Table.FromList(ListsJson, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+            "Column1", {"id","name"}, {"List Id","List Name"}),
+
+  // ==== Board Labels (id -> name/color) for fallback mapping ====
+  LabelsJson = Json.Document(
+                 Web.Contents(P[base],
+                   [ RelativePath = "boards/" & P[boardId] & "/labels",
+                     Query = [ key=P[key], token=P[token], fields="id,name,color", limit="1000" ] ])),
+  LabelsTbl = Table.ExpandRecordColumn(
+                Table.FromList(LabelsJson, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+                "Column1", {"id","name","color"}, {"Label Id","Label Name","Label Color"}),
+
+  // ==== Cards (include due) ====
+  CardsJson = Json.Document(
+                Web.Contents(P[base],
+                  [ RelativePath = "boards/" & P[boardId] & "/cards",
+                    Query = [
+                      key=P[key], token=P[token],
+                      fields="id,idShort,name,desc,idList,idLabels,dateLastActivity,due,shortUrl",
+                      members="true",
+                      labels="all", label_fields="name,color"
+                    ] ])),
+  Cards0 = Table.FromList(CardsJson, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+  Cards = Table.ExpandRecordColumn(
+            Cards0, "Column1",
+            {"id","idShort","name","desc","idList","idLabels","dateLastActivity","due","shortUrl","members","labels"},
+            {"Card UID","Card ID","Card Name","Card Desc","List Id","idLabels","Last Activity","Due Raw","Card URL","_members","_labels"}),
+
+  // Assignees → comma-separated member full names
+  WithAssignees = Table.AddColumn(
+                    Cards, "Assignees",
+                    each if _[_members]=null then null else
+                         Text.Combine(
+                           List.Transform(
+                             Table.Column(Table.FromList(_[_members], Splitter.SplitByNothing()), "Column1"),
+                             (r) => Record.FieldOrDefault(r, "fullName","")
+                           ),
+                           ", "
+                         ),
+                    type text),
+
+  // Label Names → handle embedded labels OR fall back via LabelsTbl
+  WithLabels =
+    Table.AddColumn(
+      WithAssignees, "Label Names",
+      each
+        let
+          items = _[_labels],
+          hasEmbedded =
+            try (items <> null and List.Count(items) > 0 and Value.Is(items{0}, type record)) otherwise false,
+          namesA =
+            if hasEmbedded then
+              let t = Table.ExpandRecordColumn(
+                        Table.FromList(items, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+                        "Column1", {"name","color"}, {"name","color"})
+              in List.Transform(Table.ToRecords(t), (r) => if (r[name] <> null and r[name] <> "") then r[name] else r[color])
+            else {},
+          namesB =
+            if (not hasEmbedded) then
+              let ids = try [idLabels] otherwise null,
+                  idsT =
+                    if ids=null or List.Count(ids)=0 then #table({"Label Id"}, {})
+                    else Table.FromList(List.Transform(ids, each Text.From(_)), Splitter.SplitByNothing(), {"Label Id"}),
+                  joined = Table.NestedJoin(idsT, {"Label Id"}, LabelsTbl, {"Label Id"}, "L", JoinKind.LeftOuter),
+                  expanded = Table.ExpandTableColumn(joined, "L", {"Label Name","Label Color"}, {"_Name","_Color"})
+              in List.Transform(Table.ToRecords(expanded), (r) => if (r[_Name] <> null and r[_Name] <> "") then r[_Name] else r[_Color])
+            else {},
+          names = if List.Count(namesA) > 0 then namesA else namesB
+        in
+          if List.Count(names)=0 then null else Text.Combine(names, ", "),
+      type text
+    ),
+
+  // Clean and derive Due Date (date only)
+  CardsClean1 = Table.RemoveColumns(WithLabels, {"_members","_labels"}),
+  WithDueDate = Table.AddColumn(
+                  CardsClean1, "Due Date",
+                  each if [Due Raw]=null then null else DateTime.Date(DateTime.From([Due Raw])),
+                  type date),
+
+  // ==== Comments (actions: commentCard) collapsed per card ====
+  ActsJson = Json.Document(
+               Web.Contents(P[base],
+                 [ RelativePath = "boards/" & P[boardId] & "/actions",
+                   Query = [ key=P[key], token=P[token], filter="commentCard", limit="1000" ] ])),
+  Acts0 = Table.FromList(ActsJson, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+  Acts = Table.ExpandRecordColumn(Acts0, "Column1", {"date","data"}, {"Date","_data"}),
+  CCard = Table.AddColumn(Acts, "Card UID", each try _[_data][card][id] otherwise null, type text),
+  CText = Table.AddColumn(CCard, "Comment Text", each try _[_data][text] otherwise null, type text),
+  CLine = Table.AddColumn(
+           CText, "Line",
+           each DateTime.ToText(
+                  DateTimeZone.RemoveZone(DateTimeZone.SwitchZone(DateTimeZone.From([Date]), 4)),
+                  "dd-MMM-yyyy", "en-US") & ": " & [Comment Text],
+           type text),
+  CSorted = Table.Sort(CLine, {{"Card UID", Order.Ascending}, {"Date", Order.Descending}}),
+  CommentsByCard = Table.Group(CSorted, {"Card UID"}, {{"All Comments", each Text.Combine([Line], "#(lf)"), type text}}),
+
+  // ==== Merge list name & comments; select final columns ====
+  WithList = Table.ExpandTableColumn(
+               Table.NestedJoin(WithDueDate, {"List Id"}, Lists, {"List Id"}, "L", JoinKind.LeftOuter),
+               "L", {"List Name"}, {"List Name"}),
+  WithComments = Table.ExpandTableColumn(
+                   Table.NestedJoin(WithList, {"Card UID"}, CommentsByCard, {"Card UID"}, "C", JoinKind.LeftOuter),
+                   "C", {"All Comments"}, {"All Comments"}),
+
+  Typed = Table.TransformColumnTypes(WithComments, {{"Card ID", Int64.Type}}),
+
+  Final = Table.SelectColumns(Typed,
+            {"Card ID","Card Name","Card Desc","Assignees","Label Names","Due Date","Last Activity","All Comments","List Name"}),
+    #"Renamed Columns" = Table.RenameColumns(Final,{{"Card ID", "ID"}, {"Card Name", "Task"}, {"Card Desc", "Description"}, {"Label Names", "Labels"}, {"List Name", "Status"}}),
+    #"Reordered Columns" = Table.ReorderColumns(#"Renamed Columns",{"ID", "Task", "Description", "Assignees", "Status", "Labels", "Due Date", "Last Activity", "All Comments"})
+in
+    #"Reordered Columns"
